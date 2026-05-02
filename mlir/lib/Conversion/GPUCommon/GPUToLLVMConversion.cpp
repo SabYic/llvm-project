@@ -969,39 +969,48 @@ LogicalResult LegalizeLaunchFuncOpPattern::matchAndRewrite(
 
   Location loc = launchOp.getLoc();
 
-  Value stream = Value();
-  if (!adaptor.getAsyncDependencies().empty()) {
-    stream = adaptor.getAsyncDependencies().front();
-    // Synchronize additional async dependencies onto the primary stream using
-    // events, following the same approach as gpu.wait async lowering.
-    if (adaptor.getAsyncDependencies().size() > 1) {
-      auto insertionPoint = rewriter.saveInsertionPoint();
-      SmallVector<Value, 4> events;
-      for (auto [origDep, convertedDep] :
-           llvm::zip(launchOp.getAsyncDependencies().drop_front(),
-                     adaptor.getAsyncDependencies().drop_front())) {
-        if (!isDefinedByCallTo(convertedDep,
-                               streamCreateCallBuilder.functionName)) {
-          events.push_back(convertedDep);
-          continue;
-        }
-        Operation *defOp = origDep.getDefiningOp();
-        rewriter.setInsertionPointAfter(defOp);
-        Value event =
-            eventCreateCallBuilder.create(loc, rewriter, {}).getResult();
-        eventRecordCallBuilder.create(loc, rewriter, {event, convertedDep});
-        events.push_back(event);
+  Value stream = adaptor.getAsyncObject();
+  auto syncDepsOnStream = [&](ValueRange origDeps, ValueRange convertedDeps) {
+    auto insertionPoint = rewriter.saveInsertionPoint();
+    SmallVector<Value, 4> events;
+    for (auto [origDep, convertedDep] : llvm::zip(origDeps, convertedDeps)) {
+      if (!isDefinedByCallTo(convertedDep,
+                             streamCreateCallBuilder.functionName)) {
+        events.push_back(convertedDep);
+        continue;
       }
-      rewriter.restoreInsertionPoint(insertionPoint);
-      for (Value event : events)
-        streamWaitEventCallBuilder.create(loc, rewriter, {stream, event});
-      for (Value event : events)
-        eventDestroyCallBuilder.create(loc, rewriter, {event});
+      Operation *defOp = origDep.getDefiningOp();
+      rewriter.setInsertionPointAfter(defOp);
+      Value event =
+          eventCreateCallBuilder.create(loc, rewriter, {}).getResult();
+      eventRecordCallBuilder.create(loc, rewriter, {event, convertedDep});
+      events.push_back(event);
     }
+    rewriter.restoreInsertionPoint(insertionPoint);
+    for (Value event : events)
+      streamWaitEventCallBuilder.create(loc, rewriter, {stream, event});
+    for (Value event : events)
+      eventDestroyCallBuilder.create(loc, rewriter, {event});
+  };
+
+  if (!adaptor.getAsyncDependencies().empty()) {
+    if (!stream)
+      stream = adaptor.getAsyncDependencies().front();
+
+    // Synchronize async dependencies onto the primary stream using events,
+    // following the same approach as gpu.wait async lowering. Without an
+    // explicit async object, the first dependency is reused as the primary
+    // stream and therefore skipped here.
+    if (stream == adaptor.getAsyncObject())
+      syncDepsOnStream(launchOp.getAsyncDependencies(),
+                       adaptor.getAsyncDependencies());
+    else if (adaptor.getAsyncDependencies().size() > 1)
+      syncDepsOnStream(launchOp.getAsyncDependencies().drop_front(),
+                       adaptor.getAsyncDependencies().drop_front());
   }
   // If the async keyword is present and there are no dependencies, then a
   // stream must be created to pass to subsequent operations.
-  else if (launchOp.getAsyncToken())
+  else if (launchOp.getAsyncToken() && !stream)
     stream = streamCreateCallBuilder.create(loc, rewriter, {}).getResult();
 
   // Lower the kernel operands to match kernel parameters.
